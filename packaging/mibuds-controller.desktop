@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=小米耳机控制器
+GenericName=小米耳机控制
+Comment=Linux 小米 / Redmi 耳机控制器
+Exec=mibuds-gui
+Icon=mibuds-controller
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=Bluetooth;Xiaomi;Redmi;Earbuds;
+StartupNotify=true
