@@ -48,10 +48,13 @@ class RcspClient:
         transport: Transport,
         timeout: float = 5.0,
         logger: Callable[[str], None] | None = None,
+        on_disconnect: Callable[[str], None] | None = None,
     ) -> None:
         self.transport = transport
         self.timeout = timeout
         self._logger = logger or (lambda message: None)
+        self._on_disconnect = on_disconnect
+        self._intentional_close = False
         self._condition = threading.Condition()
         self._responses: dict[int, deque[Frame]] = defaultdict(deque)
         self._inbound: dict[int, deque[Frame]] = defaultdict(deque)
@@ -69,6 +72,7 @@ class RcspClient:
         self._reader.start()
 
     def close(self) -> None:
+        self._intentional_close = True
         self._stop.set()
         try:
             self.transport.close()
@@ -252,9 +256,22 @@ class RcspClient:
                 with self._condition:
                     self._reader_error = exc
                     self._condition.notify_all()
+                self._notify_disconnect(f"RFCOMM 读取失败：{exc}")
+        else:
+            if not self._stop.is_set():
+                self._notify_disconnect("蓝牙连接已断开")
         finally:
             with self._condition:
                 self._condition.notify_all()
+
+    def _notify_disconnect(self, reason: str) -> None:
+        if self._intentional_close or self._on_disconnect is None:
+            return
+        self._logger(f"DISCONNECTED {reason}")
+        try:
+            self._on_disconnect(reason)
+        except Exception:
+            pass
 
     def _handle_inbound(self, frame: Frame) -> None:
         if frame.type == MessageType.RESPONSE:

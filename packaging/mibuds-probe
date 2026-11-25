@@ -1,2 +1,2 @@
-#!/bin/sh
+#!/usr/bin/sh
 exec /usr/bin/python3 /usr/lib/mibuds-controller/mibuds-probe "$@"

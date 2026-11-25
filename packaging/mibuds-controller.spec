@@ -1,5 +1,5 @@
 Name:           mibuds-controller
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Linux controller for Redmi Buds 8 Pro
 
@@ -43,5 +43,6 @@ install -m 0644 packaging/mibuds-controller.svg %{buildroot}%{_datadir}/icons/hi
 %{_datadir}/icons/hicolor/scalable/apps/mibuds-controller.svg
 
 %changelog
-* Wed Nov 25 2026 MiBudsController Linux Contributors - 0.1.0-1
-- Initial Linux package
+* Wed Nov 25 2026 MiBudsController Linux Contributors - 0.2.0-1
+- Add automatic reconnect, system tray, mini panel and autostart
+- Add PipeWire codec status and EasyEffects integration

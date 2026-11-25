@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import shutil
+import sys
 import threading
 import time
 from typing import Callable
@@ -12,8 +14,17 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk
 
 from .bluez import BlueZ, Device, RfcommTransport, find_rfcomm_channel
+from .audio import (
+    AudioInfo,
+    easyeffects_command,
+    easyeffects_installed,
+    get_audio_info,
+    launch_easyeffects,
+    open_audio_settings,
+)
 from .client import RcspClient
 from .protocol import RcspAncModes
+from .settings import Settings
 
 
 class DemoSession:
@@ -56,9 +67,16 @@ class DemoSession:
 
 
 class ControllerWindow(Adw.ApplicationWindow):
-    def __init__(self, demo: bool = False) -> None:
+    def __init__(self, demo: bool = False, start_minimized: bool = False, settings_store: Settings | None = None) -> None:
         super().__init__()
         self.demo = demo
+        self.start_minimized = start_minimized
+        self.settings = settings_store or Settings()
+        self.tray = None
+        self.retry_timeout_id = 0
+        self.retry_attempt = 0
+        self.retry_pending = False
+        self.closing = False
         self.client: RcspClient | DemoSession | None = None
         self.device: Device | None = None
         self.channel: int | None = None
@@ -98,7 +116,11 @@ class ControllerWindow(Adw.ApplicationWindow):
 
         self._build_device_page()
         self._build_sound_page()
+        self._build_audio_page()
+        self._build_settings_page()
         self._build_log_page()
+        self._build_mini_panel()
+        self._setup_tray()
         self._set_connected(False)
         self._append_log("MiBuds Controller for Linux")
         if demo:
@@ -260,6 +282,166 @@ class ControllerWindow(Adw.ApplicationWindow):
         stack_page.set_title("音效设置")
         stack_page.set_icon_name("multimedia-volume-control-symbolic")
 
+    def _build_audio_page(self) -> None:
+        page = self._page("音频管理", "audio", "multimedia-volume-control-symbolic")
+        group = Adw.PreferencesGroup(
+            title="蓝牙音频",
+            description="编解码器由 BlueZ / PipeWire 协商；当前 RCSP 协议不提供编解码器写入接口。",
+        )
+        self.codec_row = Adw.ActionRow(title="当前编解码器", subtitle="--")
+        self.profile_row = Adw.ActionRow(title="音频 Profile", subtitle="--")
+        self.sample_rate_row = Adw.ActionRow(title="采样率 / 声道", subtitle="--")
+        self.audio_format_row = Adw.ActionRow(title="PCM 格式", subtitle="--")
+        for row in (self.codec_row, self.profile_row, self.sample_rate_row, self.audio_format_row):
+            group.add(row)
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        refresh = Gtk.Button(label="刷新")
+        refresh.connect("clicked", lambda _button: self.refresh_audio_info())
+        system = Gtk.Button(label="系统声音设置")
+        system.connect("clicked", lambda _button: self._open_audio_settings())
+        actions.append(refresh)
+        actions.append(system)
+        self.codec_row.add_suffix(actions)
+        page.add(group)
+
+        eq_group = Adw.PreferencesGroup(
+            title="均衡器",
+            description="EQ 由 EasyEffects 处理，作用于 Linux 系统音频，不会写入耳机。",
+        )
+        self.easy_status_row = Adw.ActionRow(title="EasyEffects", subtitle="正在检测")
+        self.easy_button = Gtk.Button(label="启动 EasyEffects")
+        self.easy_button.connect("clicked", self._on_easyeffects_clicked)
+        self.easy_status_row.add_suffix(self.easy_button)
+        eq_group.add(self.easy_status_row)
+        page.add(eq_group)
+        self.stack.add_named(page, "audio")
+        stack_page = self.stack.get_page(page)
+        stack_page.set_title("音频管理")
+        stack_page.set_icon_name("multimedia-volume-control-symbolic")
+
+    def _build_settings_page(self) -> None:
+        page = self._page("设置", "settings", "preferences-system-symbolic")
+        group = Adw.PreferencesGroup(title="连接与窗口")
+        self.auto_reconnect_row = Adw.SwitchRow(
+            title="自动重连",
+            subtitle="会话中断后按指数退避自动重试，直到成功或手动停止",
+        )
+        self.auto_connect_row = Adw.SwitchRow(
+            title="启动时连接上次设备",
+            subtitle="应用启动后自动连接上次成功使用的耳机",
+        )
+        self.minimize_row = Adw.SwitchRow(
+            title="最小化到托盘",
+            subtitle="关闭主窗口时保留后台会话；从托盘退出才会结束程序",
+        )
+        self.autostart_row = Adw.SwitchRow(
+            title="开机自启",
+            subtitle="在当前用户的桌面会话中自动启动，无需 sudo",
+        )
+        for row, key in (
+            (self.auto_reconnect_row, "auto_reconnect"),
+            (self.auto_connect_row, "auto_connect"),
+            (self.minimize_row, "minimize_to_tray"),
+        ):
+            row.set_active(bool(self.settings.data[key]))
+            row.connect("notify::active", self._on_setting_changed, key)
+            group.add(row)
+        self.autostart_row.set_active(self.settings.autostart_enabled)
+        self.autostart_row.connect("notify::active", self._on_autostart_changed)
+        group.add(self.autostart_row)
+        page.add(group)
+        self.stack.add_named(page, "settings")
+        stack_page = self.stack.get_page(page)
+        stack_page.set_title("设置")
+        stack_page.set_icon_name("preferences-system-symbolic")
+
+    def _build_mini_panel(self) -> None:
+        self.mini_window = Adw.Window(transient_for=self)
+        self.mini_window.set_title("耳机迷你面板")
+        self.mini_window.set_default_size(380, 430)
+        self.mini_window.set_size_request(340, 380)
+        self.mini_window.connect("close-request", self._on_mini_close)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=16, margin_bottom=16, margin_start=16, margin_end=16)
+        self.mini_window.set_content(root)
+        self.mini_title = Gtk.Label(label="小米耳机", xalign=0.0)
+        self.mini_title.add_css_class("title-2")
+        self.mini_status = Gtk.Label(label="未连接", xalign=0.0)
+        self.mini_status.add_css_class("caption")
+        root.append(self.mini_title)
+        root.append(self.mini_status)
+
+        batteries = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.mini_battery_labels: dict[str, Gtk.Label] = {}
+        for key, title in (("left", "左"), ("right", "右"), ("case", "盒")):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            caption = Gtk.Label(label=title)
+            caption.add_css_class("caption")
+            value = Gtk.Label(label="--")
+            value.add_css_class("title-3")
+            box.append(caption)
+            box.append(value)
+            batteries.append(box)
+            self.mini_battery_labels[key] = value
+        root.append(batteries)
+
+        noise = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        noise.append(Gtk.Label(label="降噪模式", xalign=0.0))
+        modes = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        modes.add_css_class("linked")
+        self.mini_anc_buttons: dict[int, Gtk.ToggleButton] = {}
+        first = None
+        for mode, label in (
+            (int(RcspAncModes.OFF), "关闭"),
+            (int(RcspAncModes.NOISE_CANCELLING), "降噪"),
+            (int(RcspAncModes.TRANSPARENCY), "通透"),
+        ):
+            button = Gtk.ToggleButton(label=label)
+            if first is not None:
+                button.set_group(first)
+            else:
+                first = button
+            button.connect("clicked", lambda _widget, value=mode: self._on_anc_clicked(value))
+            modes.append(button)
+            self.mini_anc_buttons[mode] = button
+        self.mini_anc_buttons[int(RcspAncModes.OFF)].set_active(True)
+        noise.append(modes)
+        root.append(noise)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        main = Gtk.Button(label="主界面", hexpand=True)
+        main.connect("clicked", lambda _button: self.show_main())
+        self.mini_disconnect = Gtk.Button(label="断开连接")
+        self.mini_disconnect.connect("clicked", self._on_connect_clicked)
+        actions.append(main)
+        actions.append(self.mini_disconnect)
+        root.append(actions)
+
+    def _setup_tray(self) -> None:
+        try:
+            from .tray import TrayService
+            self.tray = TrayService(self._on_tray_action)
+            self._append_log("SYSTEM tray available")
+        except Exception as exc:
+            self.tray = None
+            self._append_log(f"SYSTEM tray unavailable: {exc}")
+
+    def _on_tray_action(self, action: str) -> None:
+        GLib.idle_add(self._handle_tray_action, action)
+
+    def _handle_tray_action(self, action: str) -> bool:
+        if action == "show":
+            self.show_main()
+        elif action == "mini":
+            self.toggle_mini()
+        elif action == "reconnect":
+            self.reconnect()
+        elif action == "disconnect":
+            if self.client is not None and not self.busy:
+                self._on_connect_clicked(None)
+        elif action == "quit":
+            self.quit_application()
+        return False
+
     def _build_log_page(self) -> None:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=18, margin_bottom=18, margin_start=18, margin_end=18)
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -285,6 +467,156 @@ class ControllerWindow(Adw.ApplicationWindow):
         stack_page.set_title("日志")
         stack_page.set_icon_name("document-open-symbolic")
 
+    def refresh_audio_info(self) -> None:
+        if self.busy:
+            return
+        if self.demo:
+            self._apply_audio_info((None, True))
+            return
+        device = self.device or self._selected_device()
+        if device is None:
+            self._show_banner("请先选择耳机，再读取音频信息。")
+            return
+        self._run_worker(
+            "正在读取 PipeWire 音频信息",
+            lambda: (get_audio_info(device.address), easyeffects_installed()),
+            self._apply_audio_info,
+        )
+
+    def _apply_audio_info(self, result: tuple[object, bool]) -> None:
+        info, easy_installed = result
+        if info is None:
+            self.codec_row.set_subtitle("未检测到蓝牙音频输出")
+            self.profile_row.set_subtitle("--")
+            self.sample_rate_row.set_subtitle("--")
+            self.audio_format_row.set_subtitle("--")
+        else:
+            self.codec_row.set_subtitle(str(info.codec))
+            self.profile_row.set_subtitle(str(info.profile))
+            rate = f"{info.sample_rate / 1000:.1f} kHz" if info.sample_rate else "--"
+            self.sample_rate_row.set_subtitle(f"{rate} / {info.channels or '--'} 声道")
+            self.audio_format_row.set_subtitle(str(info.format))
+        self.easy_status_row.set_subtitle("已安装" if easy_installed else "未安装（可通过 Flatpak 用户级安装）")
+        self.easy_button.set_label("启动 EasyEffects" if easy_installed else "安装 EasyEffects")
+
+    def _open_audio_settings(self) -> None:
+        if not open_audio_settings():
+            self._show_banner("无法自动打开系统声音设置，请手动打开桌面环境的音频设置。")
+
+    def _on_easyeffects_clicked(self, _button) -> None:
+        if easyeffects_installed():
+            if not launch_easyeffects():
+                self._show_banner("EasyEffects 启动失败，请检查 Flatpak 或应用安装状态。")
+            return
+        if easyeffects_command() is None:
+            self._show_banner("未找到 EasyEffects 或 Flatpak，请先安装 Flatpak。")
+            return
+        dialog = Adw.MessageDialog(
+            parent=self,
+            heading="安装 EasyEffects？",
+            body="将通过 Flatpak 从 Flathub 安装 EasyEffects。安装仅影响当前用户，不需要 sudo。",
+        )
+        dialog.add_response("cancel", "取消")
+        dialog.add_response("install", "安装")
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", self._on_easyeffects_install_response)
+        dialog.present()
+
+    def _on_easyeffects_install_response(self, dialog: Adw.MessageDialog, response: str) -> None:
+        dialog.destroy()
+        if response != "install":
+            return
+        self._run_worker(
+            "正在通过 Flatpak 安装 EasyEffects",
+            self._install_easyeffects,
+            lambda _result: self.refresh_audio_info(),
+        )
+
+    def _install_easyeffects(self) -> str:
+        import subprocess
+        subprocess.run(
+            ["flatpak", "install", "-y", "flathub", "com.github.wwmm.easyeffects"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=300,
+        )
+        return "EasyEffects 安装完成"
+
+    def _on_setting_changed(self, row: Adw.SwitchRow, _param, key: str) -> None:
+        self.settings.data[key] = row.get_active()
+        self.settings.save()
+        if key == "auto_reconnect" and not row.get_active():
+            self._cancel_retry()
+            self._show_banner("")
+
+    def _on_autostart_changed(self, row: Adw.SwitchRow, _param) -> None:
+        executable = shutil.which("mibuds-gui") or sys.argv[0]
+        try:
+            self.settings.set_autostart(row.get_active(), executable)
+        except OSError as exc:
+            self.syncing = True
+            row.set_active(False)
+            self.syncing = False
+            self._show_banner(f"设置开机自启失败：{exc}")
+
+    def _on_mini_close(self, _window) -> bool:
+        self.mini_window.set_visible(False)
+        return True
+
+    def show_main(self) -> None:
+        self.present()
+
+    def minimize_on_close(self) -> bool:
+        if self.settings.minimize_to_tray and self.tray is not None and not self.closing:
+            self.set_visible(False)
+            return True
+        return False
+
+    def toggle_mini(self) -> None:
+        if self.mini_window.get_visible():
+            self.mini_window.set_visible(False)
+        else:
+            self.mini_window.present()
+
+    def quit_application(self) -> None:
+        self.closing = True
+        self._cancel_retry()
+        self.shutdown_session()
+        application = self.get_application()
+        if application is not None:
+            application.quit()
+
+    def reconnect(self) -> None:
+        if self.demo or self.busy:
+            return
+        device = self.device or self._selected_device()
+        if device is None:
+            self._show_banner("请先选择需要重连的耳机。")
+            return
+        self.device = device
+        self._cancel_retry()
+        if self.client is not None:
+            self._run_worker(
+                f"正在重新连接 {device.name}",
+                lambda: self._reconnect_session(device),
+                self._after_connect,
+                lambda error: self._schedule_reconnect(str(error)),
+            )
+        else:
+            self._run_worker(
+                f"正在连接 {device.name}",
+                lambda: self._connect(device),
+                self._after_connect,
+                lambda error: self._schedule_reconnect(str(error)),
+            )
+
+    def _reconnect_session(self, device: Device) -> tuple[Device, int, RcspClient, dict[str, object]]:
+        if self.client is not None:
+            self.client.close()
+        return self._connect(device)
+
     def _start_demo(self) -> None:
         self.client = DemoSession()
         self.device = Device(
@@ -308,6 +640,16 @@ class ControllerWindow(Adw.ApplicationWindow):
         self.device_dropdown.set_sensitive(False)
         self._show_banner("演示模式：所有设置修改仅在本地模拟，不会发送到耳机。")
         self._append_log("DEMO session ready")
+        self._apply_audio_info((AudioInfo(
+            sink_id=112,
+            sink_name="bluez_output.demo",
+            device_name="REDMI Buds 8 Pro",
+            codec="AAC",
+            profile="a2dp-sink",
+            sample_rate=48000,
+            channels=2,
+            format="S16LE",
+        ), True))
 
     def refresh_devices(self) -> None:
         if self.demo or self.busy:
@@ -334,14 +676,36 @@ class ControllerWindow(Adw.ApplicationWindow):
         for device in devices:
             state = "已连接" if device.connected else "未连接"
             self.device_model.append(f"{device.name} · {state} · {device.address}")
-        self.device_dropdown.set_selected(0 if devices else Gtk.INVALID_LIST_POSITION)
+        selected_index = 0 if devices else Gtk.INVALID_LIST_POSITION
+        if self.settings.last_device_address:
+            for index, device in enumerate(devices):
+                if device.address == self.settings.last_device_address:
+                    selected_index = index
+                    break
+        self.device_dropdown.set_selected(selected_index)
         self.syncing = False
         if not devices:
             self._show_banner("没有找到已配对的小米 / Redmi 耳机，请先在系统蓝牙中配对。")
+        elif self.settings.auto_connect and self.client is None and not self.demo:
+            GLib.timeout_add(500, self._auto_connect_selected)
 
     def _on_device_selected(self, _dropdown, _param) -> None:
         if self.syncing or self.busy:
             return
+        if self.retry_pending:
+            self._cancel_retry()
+        device = self._selected_device()
+        if device is not None:
+            self.device = device
+
+    def _auto_connect_selected(self) -> bool:
+        if self.client is not None or self.busy or self.closing:
+            return False
+        device = self._selected_device()
+        if device is None:
+            return False
+        self.reconnect()
+        return False
 
     def _selected_device(self) -> Device | None:
         index = self.device_dropdown.get_selected()
@@ -352,25 +716,31 @@ class ControllerWindow(Adw.ApplicationWindow):
     def _on_connect_clicked(self, _button) -> None:
         if self.demo:
             return
+        if self.retry_pending:
+            self._cancel_retry()
+            self._show_banner("已停止自动重试")
+            return
         if self.client is not None:
+            self._cancel_retry()
             self._run_worker("正在关闭会话", self._disconnect, lambda: self._after_disconnect())
             return
         device = self._selected_device()
         if device is None:
             self._show_banner("请先选择一款已配对耳机。")
             return
-        self._run_worker(
-            f"正在连接 {device.name}",
-            lambda: self._connect(device),
-            self._after_connect,
-        )
+        self.reconnect()
 
     def _connect(self, selected: Device) -> tuple[Device, int, RcspClient, dict[str, object]]:
         bluez = BlueZ()
         device = bluez.ensure_connected(selected)
         channel = find_rfcomm_channel(device.address)
         transport = RfcommTransport(device.address, channel, timeout=1.0)
-        client = RcspClient(transport, timeout=8.0, logger=self._log_from_worker)
+        client = RcspClient(
+            transport,
+            timeout=8.0,
+            logger=self._log_from_worker,
+            on_disconnect=lambda reason: GLib.idle_add(self._on_session_disconnected, reason),
+        )
         try:
             client.start()
             auth = client.authenticate()
@@ -382,13 +752,71 @@ class ControllerWindow(Adw.ApplicationWindow):
         return device, channel, client, state
 
     def _after_connect(self, result: tuple[Device, int, RcspClient, dict[str, object]]) -> None:
+        self._cancel_retry()
         self.device, self.channel, self.client, self.last_state = result
+        self.settings.set_last_device_address(self.device.address)
         self._apply_state(self.last_state)
         self._set_connected(True)
         self.device_dropdown.set_sensitive(False)
         self._show_banner("")
+        self.refresh_audio_info()
         if self.last_state.get("errors"):
             self._show_banner("连接成功，但部分状态读取失败；详情请查看协议日志。")
+
+    def _on_session_disconnected(self, reason: str) -> bool:
+        if self.closing:
+            return False
+        self._append_log(f"SESSION interrupted: {reason}")
+        if self.client is not None:
+            self.client.close()
+        self.client = None
+        self.channel = None
+        self._apply_state({})
+        self._set_connected(False)
+        self.device_dropdown.set_sensitive(True)
+        self._schedule_reconnect(reason)
+        return False
+
+    def _schedule_reconnect(self, reason: str) -> None:
+        if self.demo or self.closing or not self.settings.auto_reconnect or self.device is None:
+            return
+        if self.retry_pending or self.busy:
+            return
+        self.retry_pending = True
+        self.retry_attempt += 1
+        delay = min(30, 2 ** min(self.retry_attempt, 5))
+        self._show_banner(f"连接中断：{reason}；{delay} 秒后自动重试（第 {self.retry_attempt} 次）")
+        self.connect_button.set_label("停止重试")
+        self.connect_button.set_sensitive(True)
+        self.device_dropdown.set_sensitive(True)
+        self.retry_timeout_id = GLib.timeout_add_seconds(delay, self._retry_tick)
+
+    def _retry_tick(self) -> bool:
+        self.retry_timeout_id = 0
+        if not self.retry_pending or self.closing:
+            self.retry_pending = False
+            return False
+        self.retry_pending = False
+        device = self.device
+        if device is None:
+            return False
+        self._run_worker(
+            f"正在自动重连 {device.name}",
+            lambda: self._connect(device),
+            self._after_connect,
+            lambda error: self._schedule_reconnect(str(error)),
+        )
+        return False
+
+    def _cancel_retry(self) -> None:
+        if self.retry_timeout_id:
+            GLib.source_remove(self.retry_timeout_id)
+            self.retry_timeout_id = 0
+        self.retry_pending = False
+        self.retry_attempt = 0
+        if not self.busy and self.client is None and not self.demo:
+            self.connect_button.set_label("连接")
+            self.connect_button.set_sensitive(True)
 
     def _disconnect(self) -> None:
         if self.client is not None:
@@ -455,10 +883,12 @@ class ControllerWindow(Adw.ApplicationWindow):
                             level_label.set_label(f"{level}%")
                             state_label.set_label("充电中" if charging else "未充电")
                             bar.set_value(level)
+                            self.mini_battery_labels[key].set_label(f"{level}%")
                         else:
                             level_label.set_label("--")
                             state_label.set_label("无读数")
                             bar.set_value(0)
+                            self.mini_battery_labels[key].set_label("--")
                 firmware = info.get("firmware_1")
                 self.firmware_row.set_subtitle(str(firmware or "--"))
                 vid = info.get("vid")
@@ -468,6 +898,7 @@ class ControllerWindow(Adw.ApplicationWindow):
             mode = run_info.get("anc_mode") if isinstance(run_info, dict) else None
             if mode in self.anc_buttons:
                 self.anc_buttons[int(mode)].set_active(True)
+                self.mini_anc_buttons[int(mode)].set_active(True)
                 self.noise_summary.set_subtitle({
                     RcspAncModes.OFF: "环境声已关闭",
                     RcspAncModes.NOISE_CANCELLING: "降噪已开启",
@@ -493,6 +924,7 @@ class ControllerWindow(Adw.ApplicationWindow):
         self.syncing = True
         try:
             self.anc_buttons[int(mode)].set_active(True)
+            self.mini_anc_buttons[int(mode)].set_active(True)
         finally:
             self.syncing = False
 
@@ -503,10 +935,22 @@ class ControllerWindow(Adw.ApplicationWindow):
         self.header_status.remove_css_class("status-disconnected")
         self.header_status.add_css_class("status-connected" if connected else "status-disconnected")
         self.connection_status_row.set_subtitle("RCSP 会话已连接" if connected else "请选择耳机后连接")
-        self.connect_button.set_label("断开连接" if connected else "连接")
+        if self.retry_pending and not connected:
+            self.connect_button.set_label("停止重试")
+        else:
+            self.connect_button.set_label("断开连接" if connected else "连接")
         for button in self.anc_buttons.values():
             button.set_sensitive(control_sensitive)
+        for button in self.mini_anc_buttons.values():
+            button.set_sensitive(control_sensitive)
         self.low_latency_row.set_sensitive(control_sensitive)
+        self.mini_disconnect.set_sensitive(connected and not self.busy)
+        self.mini_title.set_label(self.device.name if self.device and connected else "小米耳机")
+        self.mini_status.set_label("已连接" if connected else ("等待自动重连" if self.retry_pending else "未连接"))
+        if self.tray is not None:
+            title = self.device.name if self.device and connected else "小米耳机控制器"
+            text = "RCSP 已连接" if connected else ("等待自动重连" if self.retry_pending else "未连接")
+            self.tray.update(title, text, connected)
 
     def _run_worker(
         self,
@@ -584,29 +1028,38 @@ class ControllerWindow(Adw.ApplicationWindow):
         self._log_lines = 0
 
     def shutdown_session(self) -> None:
+        self.closing = True
+        self._cancel_retry()
         if self.client is not None:
             self.client.close()
-        self.client = None
+            self.client = None
+        if self.tray is not None:
+            self.tray.close()
+            self.tray = None
 
 
 class MiBudsApplication(Adw.Application):
-    def __init__(self, demo: bool = False) -> None:
+    def __init__(self, demo: bool = False, start_minimized: bool = False) -> None:
         super().__init__(application_id="org.mibudsprobe.Controller")
         self.demo = demo
+        self.start_minimized = start_minimized
 
     def do_activate(self) -> None:
         window = self.get_active_window()
         if window is None:
-            window = ControllerWindow(demo=self.demo)
+            window = ControllerWindow(demo=self.demo, start_minimized=self.start_minimized)
             window.set_application(self)
             window.connect("close-request", self._on_close)
-        window.present()
+        if not self.start_minimized or window.tray is None:
+            window.present()
 
     def _on_close(self, window: ControllerWindow) -> bool:
+        if window.minimize_on_close():
+            return True
         window.shutdown_session()
         return False
 
 
-def run_gui(demo: bool = False) -> int:
-    app = MiBudsApplication(demo=demo)
+def run_gui(demo: bool = False, start_minimized: bool = False) -> int:
+    app = MiBudsApplication(demo=demo, start_minimized=start_minimized)
     return app.run([])

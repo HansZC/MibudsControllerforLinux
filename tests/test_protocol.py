@@ -46,6 +46,9 @@ class FakeTransport:
             self.closed = True
             self.condition.notify_all()
 
+    def drop(self) -> None:
+        self.close()
+
     def receive(self, frame: Frame) -> None:
         with self.condition:
             self.incoming.append(frame.encode())
@@ -144,6 +147,17 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(low_latency.payload, b"\x03\x00\x2f\x01")
         finally:
             client.close()
+
+    def test_unexpected_disconnect_notifies(self) -> None:
+        transport = FakeTransport()
+        disconnected = threading.Event()
+        reasons: list[str] = []
+        client = RcspClient(transport, on_disconnect=lambda reason: (reasons.append(reason), disconnected.set()))
+        client.start()
+        transport.drop()
+        self.assertTrue(disconnected.wait(1))
+        self.assertIn("蓝牙连接已断开", reasons[0])
+        client.close()
 
     def test_request_timeout(self) -> None:
         transport = FakeTransport()

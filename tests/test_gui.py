@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 @unittest.skipUnless(
@@ -24,11 +26,17 @@ class GuiTests(unittest.TestCase):
 
     def setUp(self) -> None:
         from mibuds_probe.gui import ControllerWindow
-        self.window = ControllerWindow(demo=True)
+        from mibuds_probe.settings import Settings
+        self.temporary = tempfile.TemporaryDirectory()
+        self.environment = patch.dict(os.environ, {"XDG_CONFIG_HOME": self.temporary.name})
+        self.environment.start()
+        self.window = ControllerWindow(demo=True, settings_store=Settings())
 
     def tearDown(self) -> None:
         self.window.shutdown_session()
         self.window.destroy()
+        self.environment.stop()
+        self.temporary.cleanup()
 
     def _wait_idle(self) -> None:
         deadline = time.monotonic() + 3
@@ -50,6 +58,8 @@ class GuiTests(unittest.TestCase):
         self._wait_idle()
         self.assertEqual(self.window.last_state["run_info"]["anc_mode"], 1)
         self.assertTrue(self.window.anc_buttons[1].get_active())
+        self.assertTrue(self.window.mini_anc_buttons[1].get_active())
+        self.assertEqual(self.window.mini_battery_labels["left"].get_label(), "86%")
 
     def test_low_latency_round_trip(self) -> None:
         self.window.low_latency_row.set_active(True)
@@ -60,6 +70,30 @@ class GuiTests(unittest.TestCase):
         self._wait_idle()
         self.assertFalse(self.window.low_latency)
         self.assertEqual(self.window.last_state["configs"]["0x2F"]["value"], "00")
+
+    def test_audio_page_shows_demo_codec(self) -> None:
+        self.assertEqual(self.window.codec_row.get_subtitle(), "AAC")
+        self.assertEqual(self.window.profile_row.get_subtitle(), "a2dp-sink")
+        self.assertIn("48.0 kHz", self.window.sample_rate_row.get_subtitle())
+
+    def test_retry_state_can_be_cancelled(self) -> None:
+        from mibuds_probe.bluez import Device
+        self.window.demo = False
+        self.window.device = Device("/demo", "24:B2:31:96:68:50", "REDMI Buds 8 Pro", False, True, True, ())
+        self.window.settings.data["auto_reconnect"] = True
+        self.window._schedule_reconnect("test disconnect")
+        self.assertTrue(self.window.retry_pending)
+        self.assertEqual(self.window.connect_button.get_label(), "停止重试")
+        self.window._cancel_retry()
+        self.assertFalse(self.window.retry_pending)
+
+    def test_minimize_to_tray(self) -> None:
+        if self.window.tray is None:
+            self.skipTest("System tray unavailable")
+        self.window.settings.data["minimize_to_tray"] = True
+        self.assertTrue(self.window.minimize_on_close())
+        self.assertFalse(self.window.get_visible())
+        self.window.show_main()
 
     def test_page_navigation(self) -> None:
         self.window.stack.set_visible_child_name("sound")

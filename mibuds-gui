@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 import argparse
 
 from mibuds_probe.gui import run_gui
@@ -7,8 +7,9 @@ from mibuds_probe.gui import run_gui
 def main() -> int:
     parser = argparse.ArgumentParser(description="小米耳机 Linux 图形控制器")
     parser.add_argument("--demo", action="store_true", help="使用本地模拟会话，不连接真实耳机")
+    parser.add_argument("--start-minimized", action="store_true", help="启动后隐藏到系统托盘")
     args = parser.parse_args()
-    return run_gui(demo=args.demo)
+    return run_gui(demo=args.demo, start_minimized=args.start_minimized)
 
 
 if __name__ == "__main__":

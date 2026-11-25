@@ -1,11 +1,10 @@
 # MiBudsController Linux
-*此项目由AI编写  This project was created by AI
 
 > 非官方 Linux 小米 / Redmi 耳机控制工具，基于 BlueZ 与 RCSP 协议，通过蓝牙 Classic RFCOMM 控制 Redmi Buds 8 Pro。
 
 MiBudsController Linux 是一个使用 Python、GTK 4 和 libadwaita 开发的 Linux 桌面应用。项目参考了 [FallenLeeee/MiBudsController](https://github.com/FallenLeeee/MiBudsController) 的 Windows 实现，将设备发现、RFCOMM 通信、SAFER+ 鉴权和 RCSP 协议迁移到 Linux。
 
-当前版本：**0.1.0**
+当前版本：**0.2.0**
 
 ## 功能
 
@@ -17,8 +16,15 @@ MiBudsController Linux 是一个使用 Python、GTK 4 和 libadwaita 开发的 L
 - [x] 降噪模式切换：关闭、降噪、通透
 - [x] 低延迟模式开关
 - [x] 设置后自动回读设备状态
+- [x] 自动重连与连接失败指数退避重试
+- [x] 系统托盘、迷你面板、最小化到托盘
+- [x] 用户级开机自启
+- [x] PipeWire 蓝牙编解码器、采样率和音频 Profile 显示
+- [x] EasyEffects 安装、启动入口与 Linux 系统 EQ
 - [x] RCSP 原始帧与协议日志
 - [x] 无真实设备写入的演示模式
+- [x] AppImage、deb、RPM 安装包
+- [x] RPM GPG 签名与公钥分发
 
 ## 界面截图
 
@@ -33,6 +39,14 @@ MiBudsController Linux 是一个使用 Python、GTK 4 和 libadwaita 开发的 L
 ### 协议日志
 
 ![协议日志](docs/screenshots/log.png)
+
+### 音频管理
+
+![音频管理](docs/screenshots/audio-v02.png)
+
+### 迷你面板
+
+![迷你面板](docs/screenshots/mini-v02.png)
 
 ## 支持范围
 
@@ -72,8 +86,8 @@ RFCOMM 通道由设备动态决定，不硬编码。Redmi Buds 8 Pro 在测试�
 ### AppImage
 
 ```bash
-chmod +x MiBudsController-0.1.0-x86_64.AppImage
-./MiBudsController-0.1.0-x86_64.AppImage
+chmod +x MiBudsController-0.2.0-x86_64.AppImage
+./MiBudsController-0.2.0-x86_64.AppImage
 ```
 
 AppImage 已包含 Python、GTK 4、libadwaita 和蓝牙相关运行库，但仍需要宿主系统提供兼容的 glibc、D-Bus 和 BlueZ。当前 AppImage 在 Fedora 45 上构建；较旧的系统可能因 glibc 版本不足而无法运行。
@@ -89,7 +103,7 @@ sudo rpmkeys --import ./mibuds-controller-signing-key.asc
 再安装 RPM：
 
 ```bash
-sudo dnf install ./mibuds-controller-0.1.0-1.fc45.noarch.rpm
+sudo dnf install ./mibuds-controller-0.2.0-1.fc45.noarch.rpm
 ```
 
 签名公钥指纹：
@@ -101,7 +115,7 @@ EAC41C9F4C8C63F97F98710A7CCBE5B4D4FED2BE
 ### Debian / Ubuntu 系 DEB
 
 ```bash
-sudo apt install ./mibuds-controller_0.1.0-1_amd64.deb
+sudo apt install ./mibuds-controller_0.2.0-1_amd64.deb
 ```
 
 DEB 包会通过包管理器安装 Python、GTK 4、libadwaita、D-Bus 和 BlueZ 依赖。
@@ -134,9 +148,15 @@ sudo apt install python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-dbus blu
 4. 点击“连接”，等待鉴权和状态同步完成。
 5. 在设备页面查看电量、固件和降噪状态。
 6. 在“音效设置”中切换低延迟模式。
-7. 如需排查问题，打开“日志”页面查看 RCSP 收发帧。
+7. 在“音频管理”中查看当前编解码器、采样率和音频 Profile，并启动 EasyEffects 调整 Linux 系统 EQ。
+8. 在“设置”中管理自动重连、启动时连接、最小化到托盘和开机自启。
+9. 如需排查问题，打开“日志”页面查看 RCSP 收发帧。
 
-“断开连接”只会关闭应用持有的 RCSP 会话，**不会断开系统蓝牙音频连接**。
+“断开连接”只会关闭应用持有的 RCSP 会话，**不会断开系统蓝牙音频连接**。会话意外中断后，应用默认按指数退避自动重试；点击“停止重试”或关闭“自动重连”即可停止。
+
+系统托盘提供“打开主界面”“迷你面板”“重新连接”“断开连接”和“退出”。迷你面板支持电量查看与降噪切换。开机自启写入当前用户的 `~/.config/autostart`，不需要 sudo。
+
+EQ 由 EasyEffects 处理，作用于 Linux 系统音频，不会写入耳机。未安装 EasyEffects 时，音频页可通过 Flatpak 发起用户级安装。
 
 ### 演示模式
 
@@ -191,12 +211,15 @@ sudo apt install python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 python3-dbus blu
 ├── mibuds-gui                 # GTK 图形界面入口
 ├── mibuds-probe               # 只读协议探针入口
 ├── mibuds_probe/
-│   ├── bluez.py               # BlueZ D-Bus、SDP 与 RFCOMM 传输
-│   ├── client.py              # RCSP 会话、鉴权、状态读写
-│   ├── cli.py                 # 命令行界面
-│   ├── gui.py                 # GTK 4 / libadwaita 图形界面
-│   ├── protocol.py            # RCSP 帧、SAFER+、TLV 与配置常量
-│   └── __init__.py            # 版本信息
+│   ├── audio.py                # PipeWire 编解码器与 EasyEffects 集成
+│   ├── bluez.py                # BlueZ D-Bus、SDP 与 RFCOMM 传输
+│   ├── client.py               # RCSP 会话、鉴权、状态读写
+│   ├── cli.py                  # 命令行界面
+│   ├── gui.py                  # GTK 4 / libadwaita 图形界面
+│   ├── protocol.py             # RCSP 帧、SAFER+、TLV 与配置常量
+│   ├── settings.py             # 用户设置与开机自启
+│   ├── tray.py                 # StatusNotifierItem 托盘与 DBusMenu
+│   └── __init__.py             # 版本信息
 ├── packaging/                 # 桌面入口、图标与 RPM spec
 ├── tests/                     # 协议、会话与 GUI 自动化测试
 ├── docs/screenshots/          # README 截图
@@ -217,18 +240,19 @@ python3 -m unittest discover -s tests -v
 - SAFER+ 固定向量与鉴权流程
 - 请求超时与响应匹配
 - 降噪和低延迟指令编码
-- GUI 演示模式、控件状态和页面导航
+- GUI 演示模式、控件状态、页面导航、托盘和迷你面板
+- 自动重连调度与断线回调
+- PipeWire 编解码器解析、用户设置和开机自启
 
 GUI 测试需要可用的图形显示环境；在没有 `DISPLAY` 或 `WAYLAND_DISPLAY` 的环境中会自动跳过。
 
 ## 尚未实现
 
+- 智能降噪、降噪强度与通透预设控制
 - 空间音频、沉浸声、小米/杜比模式、场景渲染和头部追踪
-- 自适应听感、EQ 和音频编解码器管理
+- 自适应听感、EQ 协议写入和音频编解码器写入
 - 实时将耳机通知同步到 GUI
-- 自动重连与连接失败重试
 - 多耳机同时管理与快速切换
-- 系统托盘、迷你面板、最小化到托盘和开机自启
 - 应用内配对向导
 - ARM64 安装包
 - 其他小米 / Redmi 型号的完整适配
