@@ -1,4 +1,5 @@
 # MiBudsController Linux
+*由AI制作 Created by AI
 
 > 非官方 Linux 小米 / Redmi 耳机控制工具，基于 BlueZ 与 RCSP 协议，通过蓝牙 Classic RFCOMM 控制 Redmi Buds 8 Pro。
 
@@ -22,9 +23,7 @@ MiBudsController Linux 是一个使用 Python、GTK 4 和 libadwaita 开发的 L
 - [x] PipeWire 蓝牙编解码器、采样率和音频 Profile 显示
 - [x] EasyEffects 安装、启动入口与 Linux 系统 EQ
 - [x] RCSP 原始帧与协议日志
-- [x] 无真实设备写入的演示模式
-- [x] AppImage、deb、RPM 安装包
-- [x] RPM GPG 签名与公钥分发
+
 
 ## 界面截图
 
@@ -251,9 +250,7 @@ GUI 测试需要可用的图形显示环境；在没有 `DISPLAY` 或 `WAYLAND_D
 - 智能降噪、降噪强度与通透预设控制
 - 空间音频、沉浸声、小米/杜比模式、场景渲染和头部追踪
 - 自适应听感、EQ 协议写入和音频编解码器写入
-- 实时将耳机通知同步到 GUI
 - 多耳机同时管理与快速切换
-- 应用内配对向导
 - ARM64 安装包
 - 其他小米 / Redmi 型号的完整适配
 
